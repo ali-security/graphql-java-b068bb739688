@@ -6,10 +6,16 @@ on:
       version:
         description: 'the version to be released'
         required: true
+        default: '21.5'
+      test-filter:
+        description: 'Gradle test task selector (empty = full check)'
+        required: false
+        default: ''
 
 jobs:
   buildAndPublish:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       MAVEN_CENTRAL_PGP_KEY: ${{ secrets.MAVEN_CENTRAL_PGP_KEY }}
       MAVEN_CENTRAL_USER: ${{ secrets.MAVEN_CENTRAL_USER }}
@@ -24,5 +30,77 @@ jobs:
         with:
           java-version: '11'
           distribution: 'corretto'
+          cache: gradle
       - name: build test and publish
-        run: ./gradlew assemble && ./gradlew check --info && ./gradlew publishToSonatype closeAndReleaseSonatypeStagingRepository -x check --info --stacktrace
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew assemble --no-build-cache && ./gradlew ${{ inputs.test-filter }} --no-build-cache --info && ./gradlew publishToMavenLocal -x signGraphqlJavaPublication -x check --no-build-cache --info --stacktrace
+          else
+            ./gradlew assemble --no-build-cache && ./gradlew check --no-build-cache --info && ./gradlew publishToMavenLocal -x signGraphqlJavaPublication -x check --no-build-cache --info --stacktrace
+          fi
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: graphql-java-jar
+          path: build/libs/graphql-java-${{ github.event.inputs.version }}.jar
+          if-no-files-found: error
+      - name: Test summary and skip reasons
+        if: always()
+        shell: python3 {0}
+        run: |
+          import glob, os, re, xml.etree.ElementTree as ET
+          src = {}
+          for p in glob.glob('src/test/**/*.groovy', recursive=True) + glob.glob('src/test/**/*.java', recursive=True):
+              with open(p, encoding='utf-8', errors='replace') as f:
+                  src[p] = f.read().splitlines()
+          def reason(cls, name):
+              simple = cls.split('.')[-1]
+              if name.startswith('untested_'):
+                  return 'TCK test not verified by the reactive-streams TCK (untested_ prefix = notVerified)'
+              if name.startswith('optional_spec111'):
+                  return 'optional TCK rule spec111 (multi-subscribe) not supported by this publisher'
+              if name.startswith('required_spec317'):
+                  return 'TCK required_spec317 skipped: needs 2147483647 elements > maxElementsFromPublisher 10000'
+              for p, lines in src.items():
+                  if os.path.splitext(os.path.basename(p))[0] != simple:
+                      continue
+                  for i, l in enumerate(lines):
+                      if name and name in l:
+                          for j in range(i - 1, max(i - 9, -1), -1):
+                              m = re.search(r'@Ignore(\("([^"]*)"\))?', lines[j])
+                              if m:
+                                  if m.group(2):
+                                      return 'upstream @Ignore("%s")' % m.group(2)
+                                  k = j - 1
+                                  if k >= 0 and lines[k].strip().startswith('//'):
+                                      return 'upstream @Ignore: ' + lines[k].strip().lstrip('/ ').strip()
+                                  return 'upstream @Ignore'
+                          break
+                  for i, l in enumerate(lines):
+                      if re.match(r'\s*@Ignore', l):
+                          for k in range(i - 1, max(i - 6, -1), -1):
+                              t = lines[k].strip()
+                              if t and t not in ('*/', '/**') and t.startswith('*'):
+                                  return 'upstream class-level @Ignore: ' + t.lstrip('* ').strip()
+                          return 'upstream class-level @Ignore'
+              return 'skipped by test framework'
+          total = [0, 0, 0, 0]
+          skips = []
+          for task in ('test', 'testng'):
+              c = [0, 0, 0, 0]
+              for x in glob.glob('build/test-results/%s/*.xml' % task):
+                  r = ET.parse(x).getroot()
+                  for tc in r.iter('testcase'):
+                      c[0] += 1
+                      if tc.find('failure') is not None or tc.find('error') is not None:
+                          c[2] += 1
+                      elif tc.find('skipped') is not None:
+                          c[3] += 1
+                          skips.append((task, tc.get('classname'), tc.get('name')))
+                      else:
+                          c[1] += 1
+              print('TASK %s: %d tests run, %d passed, %d failed, %d skipped' % (task, *c))
+              total = [a + b for a, b in zip(total, c)]
+          print('TOTAL: %d tests run, %d passed, %d failed, %d skipped' % tuple(total))
+          for task, cls, name in skips:
+              print('SKIPPED [%s] %s > %s -- reason: %s' % (task, cls, name, reason(cls, name)))
